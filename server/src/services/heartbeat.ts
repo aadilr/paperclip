@@ -706,15 +706,24 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0]);
   }
 
+  const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"];
+
   async function setRunStatus(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    // Prevent overwriting a terminal status (race between adapter completion
+    // and reapOrphanedRuns / external timeout enforcers).
     const updated = await db
       .update(heartbeatRuns)
       .set({ status, ...patch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          sql`${heartbeatRuns.status} NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')`,
+        ),
+      )
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -1294,8 +1303,20 @@ export function heartbeatService(db: Db) {
 
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
-      if (latestRun?.status === "cancelled") {
-        outcome = "cancelled";
+      const alreadyTerminal = latestRun && TERMINAL_RUN_STATUSES.includes(latestRun.status);
+      if (alreadyTerminal) {
+        // Run was already finalized externally (e.g. by reapOrphanedRuns or a
+        // timeout enforcer).  Respect that decision instead of overwriting.
+        // Map the DB status back to an outcome type.
+        logger.warn(
+          { runId, currentStatus: latestRun.status, adapterExitCode: adapterResult.exitCode },
+          "adapter completed but run was already finalized externally; respecting existing status",
+        );
+        outcome =
+          latestRun.status === "succeeded" ? "succeeded"
+          : latestRun.status === "cancelled" ? "cancelled"
+          : latestRun.status === "timed_out" ? "timed_out"
+          : "failed";
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
       } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
@@ -1327,39 +1348,43 @@ export function heartbeatService(db: Db) {
             } as Record<string, unknown>)
           : null;
 
-      await setRunStatus(run.id, status, {
-        finishedAt: new Date(),
-        error:
-          outcome === "succeeded"
-            ? null
-            : adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-        errorCode:
-          outcome === "timed_out"
-            ? "timeout"
-            : outcome === "cancelled"
-              ? "cancelled"
-              : outcome === "failed"
-                ? (adapterResult.errorCode ?? "adapter_failed")
-                : null,
-        exitCode: adapterResult.exitCode,
-        signal: adapterResult.signal,
-        usageJson,
-        resultJson: adapterResult.resultJson ?? null,
-        sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
-        stdoutExcerpt,
-        stderrExcerpt,
-        logBytes: logSummary?.bytes,
-        logSha256: logSummary?.sha256,
-        logCompressed: logSummary?.compressed ?? false,
-      });
+      // When the run was already finalized externally, skip status/event/state
+      // updates to avoid overwriting the authoritative result.
+      if (!alreadyTerminal) {
+        await setRunStatus(run.id, status, {
+          finishedAt: new Date(),
+          error:
+            outcome === "succeeded"
+              ? null
+              : adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+          errorCode:
+            outcome === "timed_out"
+              ? "timeout"
+              : outcome === "cancelled"
+                ? "cancelled"
+                : outcome === "failed"
+                  ? (adapterResult.errorCode ?? "adapter_failed")
+                  : null,
+          exitCode: adapterResult.exitCode,
+          signal: adapterResult.signal,
+          usageJson,
+          resultJson: adapterResult.resultJson ?? null,
+          sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+          stdoutExcerpt,
+          stderrExcerpt,
+          logBytes: logSummary?.bytes,
+          logSha256: logSummary?.sha256,
+          logCompressed: logSummary?.compressed ?? false,
+        });
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
-        finishedAt: new Date(),
-        error: adapterResult.errorMessage ?? null,
-      });
+        await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+          finishedAt: new Date(),
+          error: adapterResult.errorMessage ?? null,
+        });
+      }
 
-      const finalizedRun = await getRun(run.id);
-      if (finalizedRun) {
+      const finalizedRun = alreadyTerminal ? latestRun : await getRun(run.id);
+      if (finalizedRun && !alreadyTerminal) {
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
@@ -1371,9 +1396,7 @@ export function heartbeatService(db: Db) {
           },
         });
         await releaseIssueExecutionAndPromote(finalizedRun);
-      }
 
-      if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         });

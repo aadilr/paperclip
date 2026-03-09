@@ -16,8 +16,10 @@ import {
   ensurePathInEnv,
   renderTemplate,
   runChildProcess,
+  estimateCostUsd,
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseGeminiStreamJson, isGeminiSessionNotFoundError } from "./parse.js";
+import { DEFAULT_GEMINI_LOCAL_MODEL } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_SKILLS_CANDIDATES = [
@@ -336,9 +338,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "google",
-      model,
+      model: model || DEFAULT_GEMINI_LOCAL_MODEL,
       billingType,
-      costUsd: null,
+      costUsd: attempt.parsed.usage
+        ? estimateCostUsd(
+            model || DEFAULT_GEMINI_LOCAL_MODEL,
+            attempt.parsed.usage.inputTokens,
+            attempt.parsed.usage.outputTokens,
+            attempt.parsed.usage.cachedInputTokens,
+          )
+        : null,
       resultJson: {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,

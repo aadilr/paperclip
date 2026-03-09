@@ -295,3 +295,71 @@ export async function runChildProcess(
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// Token-based cost estimation for adapters that don't report cost natively
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-million-token pricing for known models.
+ * Prices are in USD per 1 million tokens.
+ * cachedInput pricing is optional; defaults to inputPer1M if not specified.
+ */
+interface ModelPricing {
+  inputPer1M: number;
+  cachedInputPer1M?: number;
+  outputPer1M: number;
+}
+
+const MODEL_PRICING: Record<string, ModelPricing> = {
+  // OpenAI Codex / GPT-5 family
+  "gpt-5.4":              { inputPer1M: 2.00, cachedInputPer1M: 0.50, outputPer1M: 8.00 },
+  "gpt-5.3-codex":        { inputPer1M: 2.00, cachedInputPer1M: 0.50, outputPer1M: 8.00 },
+  "gpt-5.3-codex-spark":  { inputPer1M: 0.50, cachedInputPer1M: 0.125, outputPer1M: 2.00 },
+  "gpt-5":                { inputPer1M: 2.00, cachedInputPer1M: 0.50, outputPer1M: 8.00 },
+  "gpt-5-mini":           { inputPer1M: 0.30, cachedInputPer1M: 0.075, outputPer1M: 1.20 },
+  "gpt-5-nano":           { inputPer1M: 0.10, cachedInputPer1M: 0.025, outputPer1M: 0.40 },
+  "o3":                   { inputPer1M: 2.00, cachedInputPer1M: 0.50, outputPer1M: 8.00 },
+  "o4-mini":              { inputPer1M: 1.10, cachedInputPer1M: 0.275, outputPer1M: 4.40 },
+  "o3-mini":              { inputPer1M: 1.10, cachedInputPer1M: 0.275, outputPer1M: 4.40 },
+  "codex-mini-latest":    { inputPer1M: 1.50, cachedInputPer1M: 0.375, outputPer1M: 6.00 },
+
+  // Google Gemini family
+  "gemini-2.5-pro":       { inputPer1M: 1.25, cachedInputPer1M: 0.3125, outputPer1M: 10.00 },
+  "gemini-2.5-flash":     { inputPer1M: 0.15, cachedInputPer1M: 0.0375, outputPer1M: 0.60 },
+  "gemini-2.5-flash-lite":{ inputPer1M: 0.075, cachedInputPer1M: 0.01875, outputPer1M: 0.30 },
+
+  // Anthropic (fallback for adapters that route through codex/gemini but report claude models)
+  "claude-opus-4-6":              { inputPer1M: 15.00, cachedInputPer1M: 1.50, outputPer1M: 75.00 },
+  "claude-sonnet-4":              { inputPer1M: 3.00, cachedInputPer1M: 0.30, outputPer1M: 15.00 },
+  "claude-sonnet-4-20250514":     { inputPer1M: 3.00, cachedInputPer1M: 0.30, outputPer1M: 15.00 },
+};
+
+/**
+ * Estimate the cost in USD for a given model and token usage.
+ * Returns null if the model is unknown (no pricing data).
+ *
+ * @param model - The model identifier string
+ * @param inputTokens - Number of non-cached input tokens
+ * @param outputTokens - Number of output tokens
+ * @param cachedInputTokens - Number of cached input tokens (optional, defaults to 0)
+ */
+export function estimateCostUsd(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cachedInputTokens = 0,
+): number | null {
+  const pricing = MODEL_PRICING[model];
+  if (!pricing) return null;
+
+  const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
+  const cachedInputPer1M = pricing.cachedInputPer1M ?? pricing.inputPer1M;
+
+  const cost =
+    (uncachedInputTokens / 1_000_000) * pricing.inputPer1M +
+    (cachedInputTokens / 1_000_000) * cachedInputPer1M +
+    (outputTokens / 1_000_000) * pricing.outputPer1M;
+
+  return cost;
+}
