@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -30,6 +31,11 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
+
+// Symphony orchestration patterns — in-memory state
+const runActivityTracker = new Map<string, number>(); // runId → Date.now()
+const continuationCounts = new Map<string, number>(); // agentId → consecutive count
+const agentBackoffState = new Map<string, { consecutiveFailures: number; nextEligibleAt: number }>();
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
@@ -943,7 +949,9 @@ export function heartbeatService(db: Db) {
         });
         await releaseIssueExecutionAndPromote(updatedRun);
       }
-      await finalizeAgentStatus(run.agentId, "failed");
+      // Use "cancelled" so the agent goes back to idle, not error —
+      // process_lost is an infrastructure issue, not an agent fault.
+      await finalizeAgentStatus(run.agentId, "cancelled");
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -1055,6 +1063,9 @@ export function heartbeatService(db: Db) {
       }
       run = claimed;
     }
+
+    // Symphony: initialize activity tracker for stall detection
+    runActivityTracker.set(runId, Date.now());
 
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -1216,6 +1227,9 @@ export function heartbeatService(db: Db) {
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, chunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, chunk);
 
+        // Symphony: track output for stall detection
+        runActivityTracker.set(runId, Date.now());
+
         if (handle) {
           await runLogStore.append(handle, {
             stream,
@@ -1283,11 +1297,114 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      // Subscription pool: inject CLAUDE_CONFIG_DIR so the agent process uses
+      // credentials from a specific subscription slot directory.
+      // Claude CLI resolves its config dir as: $CLAUDE_CONFIG_DIR ?? ~/.claude
+      // Credentials live at $CLAUDE_CONFIG_DIR/.credentials.json
+      // Data flow: resolvedConfig.env → adapter.execute(config) → claude-local
+      // execute.ts merges config.env into the spawned process environment.
+      //
+      // Supports two modes:
+      //   1. subscriptionConfigDir (string) — fixed slot assignment
+      //   2. subscriptionSlots (string[]) + subscriptionStrategy — pool rotation
+      //      Strategies: "round-robin" (default) alternates each run,
+      //                  "failover" uses first slot until a run fails then advances.
+      const SUBSCRIPTION_SLOTS_ROOT = path.resolve(os.homedir(), ".paperclip/subscription-slots");
+
+      async function validateSlotDir(slotPath: string): Promise<string | null> {
+        const resolved = path.resolve(slotPath);
+        if (!resolved.startsWith(SUBSCRIPTION_SLOTS_ROOT + path.sep)) {
+          logger.warn(
+            { agentId: agent.id, subscriptionConfigDir: resolved },
+            "subscriptionConfigDir outside allowed prefix; ignoring",
+          );
+          return null;
+        }
+        try {
+          const stat = await fs.lstat(resolved);
+          if (stat.isSymbolicLink()) throw new Error("symlink not allowed");
+          if (!stat.isDirectory()) throw new Error("not a directory");
+          const canonicalRoot = await fs.realpath(SUBSCRIPTION_SLOTS_ROOT);
+          const canonicalResolved = await fs.realpath(resolved);
+          if (!canonicalResolved.startsWith(canonicalRoot + path.sep)) {
+            throw new Error("resolved path escapes allowed prefix");
+          }
+          return canonicalResolved;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          const level = code === "ENOENT" || code === "ENOTDIR" ? "warn" : "error";
+          logger[level](
+            { agentId: agent.id, subscriptionConfigDir: resolved, err },
+            "subscriptionConfigDir validation failed; ignoring",
+          );
+          return null;
+        }
+      }
+
+      let subConfigDir: string | undefined;
+      if (agent.adapterType === "claude_local") {
+        const rc = parseObject(agent.runtimeConfig);
+        const singleSlot = rc.subscriptionConfigDir;
+        const poolSlots = rc.subscriptionSlots;
+
+        if (Array.isArray(poolSlots) && poolSlots.length > 0) {
+          // Pool mode: resolve slot names to full paths under SUBSCRIPTION_SLOTS_ROOT
+          const slotNames = poolSlots.filter((s): s is string => typeof s === "string");
+          const strategy = typeof rc.subscriptionStrategy === "string" ? rc.subscriptionStrategy : "round-robin";
+
+          if (slotNames.length > 0) {
+            // Get previous run's slot and status (exclude current run which has null usageJson)
+            const [lastRun] = await db
+              .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
+              .from(heartbeatRuns)
+              .where(and(eq(heartbeatRuns.agentId, agent.id), ne(heartbeatRuns.id, run.id)))
+              .orderBy(desc(heartbeatRuns.createdAt))
+              .limit(1);
+
+            const lastSlot = lastRun?.usageJson
+              ? (parseObject(lastRun.usageJson) as Record<string, unknown>).subscriptionSlot as string | undefined
+              : undefined;
+
+            let selectedName: string;
+            if (strategy === "failover") {
+              // Stick with current slot; advance to next only if last run failed
+              if (lastRun?.status === "failed" && lastSlot) {
+                const lastIdx = slotNames.indexOf(lastSlot);
+                selectedName = slotNames[(lastIdx + 1) % slotNames.length];
+              } else {
+                selectedName = lastSlot && slotNames.includes(lastSlot) ? lastSlot : slotNames[0];
+              }
+            } else {
+              // round-robin: advance to next slot after each run
+              if (lastSlot && slotNames.includes(lastSlot)) {
+                const lastIdx = slotNames.indexOf(lastSlot);
+                selectedName = slotNames[(lastIdx + 1) % slotNames.length];
+              } else {
+                selectedName = slotNames[0];
+              }
+            }
+
+            const validated = await validateSlotDir(path.join(SUBSCRIPTION_SLOTS_ROOT, selectedName));
+            if (validated) subConfigDir = validated;
+          }
+        } else if (singleSlot && typeof singleSlot === "string") {
+          // Single slot mode (explicit assignment)
+          subConfigDir = await validateSlotDir(singleSlot) ?? undefined;
+        }
+      }
+
+      const configForAdapter = subConfigDir
+        ? {
+            ...resolvedConfig,
+            env: { ...(parseObject(resolvedConfig.env) as Record<string, string>), CLAUDE_CONFIG_DIR: subConfigDir },
+          }
+        : resolvedConfig;
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
         runtime: runtimeForAdapter,
-        config: resolvedConfig,
+        config: configForAdapter,
         context,
         onLog,
         onMeta: onAdapterMeta,
@@ -1339,12 +1456,14 @@ export function heartbeatService(db: Db) {
               ? "timed_out"
               : "failed";
 
+      const subscriptionSlot = subConfigDir ? path.basename(subConfigDir) : undefined;
       const usageJson =
-        adapterResult.usage || adapterResult.costUsd != null
+        adapterResult.usage || adapterResult.costUsd != null || subscriptionSlot
           ? ({
               ...(adapterResult.usage ?? {}),
               ...(adapterResult.costUsd != null ? { costUsd: adapterResult.costUsd } : {}),
               ...(adapterResult.billingType ? { billingType: adapterResult.billingType } : {}),
+              ...(subscriptionSlot ? { subscriptionSlot } : {}),
             } as Record<string, unknown>)
           : null;
 
@@ -1421,6 +1540,64 @@ export function heartbeatService(db: Db) {
         }
       }
       await finalizeAgentStatus(agent.id, outcome);
+
+      // Symphony: cleanup activity tracker
+      runActivityTracker.delete(runId);
+
+      // Symphony: backoff + continuation state management
+      if (outcome === "failed" || outcome === "timed_out") {
+        const prev = agentBackoffState.get(agent.id);
+        const n = (prev?.consecutiveFailures ?? 0) + 1;
+        const delaySec = Math.min(30 * Math.pow(2, n - 1), 1800);
+        agentBackoffState.set(agent.id, {
+          consecutiveFailures: n,
+          nextEligibleAt: Date.now() + delaySec * 1000,
+        });
+        continuationCounts.delete(agent.id);
+      } else if (outcome === "succeeded") {
+        agentBackoffState.delete(agent.id);
+
+        // Symphony: continuation turns — re-queue if agent has pending work
+        const rc = parseObject(agent.runtimeConfig);
+        const hbCfg = parseObject(rc.heartbeat);
+        const continuationEnabled = asBoolean(hbCfg.continuationEnabled, true);
+        const maxTurns = Math.max(1, asNumber(hbCfg.maxContinuationTurns, 3));
+        const count = (continuationCounts.get(agent.id) ?? 0) + 1;
+
+        if (continuationEnabled && count <= maxTurns) {
+          const pending = await db
+            .select({ id: issues.id })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.assigneeAgentId, agent.id),
+                inArray(issues.status, ["todo", "in_progress", "blocked"]),
+              ),
+            )
+            .limit(1);
+
+          if (pending.length > 0) {
+            continuationCounts.set(agent.id, count);
+            setTimeout(() => {
+              void enqueueWakeup(agent.id, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: `Continuation turn ${count}/${maxTurns}`,
+                requestedByActorType: "system",
+                requestedByActorId: "continuation",
+              }).catch((contErr) => {
+                logger.warn({ err: contErr, agentId: agent.id }, "continuation wakeup failed");
+              });
+            }, 30_000);
+          } else {
+            continuationCounts.delete(agent.id);
+          }
+        } else {
+          continuationCounts.delete(agent.id);
+        }
+      } else {
+        continuationCounts.delete(agent.id);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown adapter failure";
       logger.error({ err, runId }, "heartbeat execution failed");
@@ -1482,6 +1659,17 @@ export function heartbeatService(db: Db) {
       }
 
       await finalizeAgentStatus(agent.id, "failed");
+
+      // Symphony: cleanup on failure
+      runActivityTracker.delete(runId);
+      const prevBackoff = agentBackoffState.get(agent.id);
+      const nFail = (prevBackoff?.consecutiveFailures ?? 0) + 1;
+      const delaySecFail = Math.min(30 * Math.pow(2, nFail - 1), 1800);
+      agentBackoffState.set(agent.id, {
+        consecutiveFailures: nFail,
+        nextEligibleAt: Date.now() + delaySecFail * 1000,
+      });
+      continuationCounts.delete(agent.id);
     } finally {
       await startNextQueuedRunForAgent(agent.id);
     }
@@ -2095,6 +2283,159 @@ export function heartbeatService(db: Db) {
     return newRun;
   }
 
+  // Symphony: reconcile running issues — kill runs whose triggering issue was externally resolved
+  async function reconcileRunningIssues() {
+    const activeRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+
+    let reconciled = 0;
+
+    for (const run of activeRuns) {
+      if (!runningProcesses.has(run.id)) continue;
+
+      const context = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(context.issueId);
+      if (!issueId) continue;
+
+      const issue = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!issue || issue.status === "done" || issue.status === "cancelled") {
+        const running = runningProcesses.get(run.id);
+        if (running) {
+          running.child.kill("SIGTERM");
+          const graceMs = Math.max(1, running.graceSec) * 1000;
+          setTimeout(() => {
+            if (!running.child.killed) running.child.kill("SIGKILL");
+          }, graceMs);
+        }
+
+        await setRunStatus(run.id, "cancelled", {
+          finishedAt: new Date(),
+          error: "Issue externally resolved",
+          errorCode: "issue_reconciled",
+        });
+
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt: new Date(),
+          error: "Issue externally resolved",
+        });
+
+        const cancelledRun = await getRun(run.id);
+        if (cancelledRun) {
+          await appendRunEvent(cancelledRun, 1, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: `Run cancelled: issue ${issueId} externally resolved (status: ${issue?.status ?? "deleted"})`,
+          });
+          await releaseIssueExecutionAndPromote(cancelledRun);
+        }
+
+        runningProcesses.delete(run.id);
+        runActivityTracker.delete(run.id);
+        await finalizeAgentStatus(run.agentId, "cancelled");
+        await startNextQueuedRunForAgent(run.agentId);
+        reconciled += 1;
+      }
+    }
+
+    if (reconciled > 0) {
+      logger.info({ reconciled }, "reconciled running issues");
+    }
+    return { reconciled };
+  }
+
+  // Symphony: detect and kill stalled runs — no output for stallTimeoutSec
+  async function detectStalledRuns() {
+    const now = Date.now();
+    let stalled = 0;
+
+    for (const [runId, lastActivity] of runActivityTracker) {
+      if (!runningProcesses.has(runId)) {
+        runActivityTracker.delete(runId);
+        continue;
+      }
+
+      const run = await getRun(runId);
+      if (!run || run.status !== "running") {
+        runActivityTracker.delete(runId);
+        continue;
+      }
+
+      const agent = await getAgent(run.agentId);
+      if (!agent) {
+        runActivityTracker.delete(runId);
+        continue;
+      }
+
+      const runtimeConfig = parseObject(agent.runtimeConfig);
+      const hbConfig = parseObject(runtimeConfig.heartbeat);
+      const stallTimeout = asNumber(hbConfig.stallTimeoutSec, 300);
+
+      if (now - lastActivity > stallTimeout * 1000) {
+        const running = runningProcesses.get(runId);
+        if (running) {
+          running.child.kill("SIGTERM");
+          const graceMs = Math.max(1, running.graceSec) * 1000;
+          setTimeout(() => {
+            if (!running.child.killed) running.child.kill("SIGKILL");
+          }, graceMs);
+        }
+
+        await setRunStatus(runId, "timed_out", {
+          finishedAt: new Date(),
+          error: `Stalled: no output for ${stallTimeout}s`,
+          errorCode: "stall_timeout",
+        });
+
+        await setWakeupStatus(run.wakeupRequestId, "timed_out", {
+          finishedAt: new Date(),
+          error: `Stalled: no output for ${stallTimeout}s`,
+        });
+
+        const timedOutRun = await getRun(runId);
+        if (timedOutRun) {
+          await appendRunEvent(timedOutRun, 1, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "error",
+            message: `Run stalled: no output for ${stallTimeout}s`,
+          });
+          await releaseIssueExecutionAndPromote(timedOutRun);
+        }
+
+        runningProcesses.delete(runId);
+        runActivityTracker.delete(runId);
+        await finalizeAgentStatus(run.agentId, "timed_out");
+        await startNextQueuedRunForAgent(run.agentId);
+
+        // Re-queue with retry
+        void enqueueWakeup(run.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "Retry after stall",
+          requestedByActorType: "system",
+          requestedByActorId: "stall_detector",
+        }).catch((retryErr) => {
+          logger.warn({ err: retryErr, agentId: run.agentId }, "stall retry wakeup failed");
+        });
+
+        stalled += 1;
+      }
+    }
+
+    if (stalled > 0) {
+      logger.warn({ stalled }, "detected and killed stalled runs");
+    }
+    return { stalled };
+  }
+
   return {
     list: (companyId: string, agentId?: string, limit?: number) => {
       const query = db
@@ -2227,6 +2568,8 @@ export function heartbeatService(db: Db) {
     wakeup: enqueueWakeup,
 
     reapOrphanedRuns,
+    reconcileRunningIssues,
+    detectStalledRuns,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);
@@ -2243,6 +2586,13 @@ export function heartbeatService(db: Db) {
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+
+        // Symphony: exponential backoff on consecutive failures
+        const backoff = agentBackoffState.get(agent.id);
+        if (backoff && Date.now() < backoff.nextEligibleAt) {
+          skipped += 1;
+          continue;
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",

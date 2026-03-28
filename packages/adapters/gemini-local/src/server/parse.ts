@@ -125,5 +125,5 @@ export function parseGeminiStreamJson(stdout: string): GeminiJsonResult {
 
 export function isGeminiSessionNotFoundError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`;
-  return /session .* not found|invalid session|no such session|cannot resume/i.test(haystack);
+  return /session .* not found|no previous sessions found|invalid session|no such session|cannot resume|error resuming session/i.test(haystack);
 }

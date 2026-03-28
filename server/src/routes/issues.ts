@@ -26,6 +26,7 @@ import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { checkDuplicateIssue, addDedupComment } from "./issues-dedup.js";
 
 const MAX_ATTACHMENT_BYTES = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
@@ -421,6 +422,79 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
+
+    // --- Duplicate detection ---
+    const dedupResult = await checkDuplicateIssue(db, companyId, req.body.title);
+    if (dedupResult.isDuplicate) {
+      const existing = dedupResult.existingIssue;
+      await addDedupComment(db, existing.id, companyId, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.deduplicated",
+        entityType: "issue",
+        entityId: existing.id,
+        details: {
+          attemptedTitle: req.body.title,
+          existingTitle: existing.title,
+          existingIdentifier: existing.identifier,
+        },
+      });
+
+      const fullIssue = await svc.getById(existing.id);
+      res.status(200).json({ ...fullIssue, deduplicated: true });
+      return;
+    }
+
+    // Auto-detect project from title when not explicitly set.
+    // Matches prefixes like "ETP:", "CB:" and bracket tags like "[costbench]"
+    if (!req.body.projectId) {
+      const titleLower = (req.body.title as string).toLowerCase();
+      const projects = await projectsSvc.list(companyId);
+      const ALIASES: Record<string, string> = {
+        etp: "editthispic",
+        editthispic: "editthispic",
+        cb: "costbench",
+        costbench: "costbench",
+        ctf: "changethisfile",
+        changethisfile: "changethisfile",
+        rj: "roamjobs",
+        roamjobs: "roamjobs",
+        bml: "buildmylisting",
+        buildmylisting: "buildmylisting",
+      };
+      // Check "PREFIX:" at start of title
+      const prefixMatch = titleLower.match(/^(\w+):/);
+      // Check "[project]" anywhere in title
+      const bracketMatch = titleLower.match(/\[(\w+)\]/);
+      const candidates = [prefixMatch?.[1], bracketMatch?.[1]].filter(Boolean) as string[];
+      for (const candidate of candidates) {
+        const projectName = ALIASES[candidate];
+        if (projectName) {
+          const match = projects.find((p) => p.name.toLowerCase() === projectName);
+          if (match) {
+            req.body.projectId = match.id;
+            break;
+          }
+        }
+      }
+    }
+
+    // Auto-link goal from project when not explicitly set
+    if (req.body.projectId && !req.body.goalId) {
+      const projectForGoal = await projectsSvc.getById(req.body.projectId);
+      if (projectForGoal && projectForGoal.goalIds.length > 0) {
+        req.body.goalId = projectForGoal.goalIds[0];
+      }
+    }
+
     const issue = await svc.create(companyId, {
       ...req.body,
       createdByAgentId: actor.agentId,

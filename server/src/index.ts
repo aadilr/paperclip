@@ -26,6 +26,7 @@ import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { heartbeatService } from "./services/index.js";
+import { runningProcesses } from "./adapters/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -521,6 +522,20 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "periodic reap of orphaned heartbeat runs failed");
         });
+
+      // Symphony: reconcile runs whose issues were externally resolved
+      void heartbeat
+        .reconcileRunningIssues()
+        .catch((err) => {
+          logger.error({ err }, "reconcile running issues failed");
+        });
+
+      // Symphony: detect and kill stalled runs
+      void heartbeat
+        .detectStalledRuns()
+        .catch((err) => {
+          logger.error({ err }, "detect stalled runs failed");
+        });
     }, config.heartbeatSchedulerIntervalMs);
   }
   
@@ -632,18 +647,49 @@ export async function startServer(): Promise<StartedServer> {
     });
   });
   
-  if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
+  {
+    let shuttingDown = false;
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
-      logger.info({ signal }, "Stopping embedded PostgreSQL");
-      try {
-        await embeddedPostgres?.stop();
-      } catch (err) {
-        logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-      } finally {
-        process.exit(0);
+      if (shuttingDown) return;
+      shuttingDown = true;
+
+      // 1. Drain running agent processes
+      if (runningProcesses.size > 0) {
+        logger.info({ signal, count: runningProcesses.size }, "Graceful shutdown: draining agent processes");
+        const DRAIN_TIMEOUT_MS = 10_000;
+        const drainPromises: Promise<void>[] = [];
+        for (const [runId, running] of runningProcesses) {
+          running.child.kill("SIGTERM");
+          drainPromises.push(
+            new Promise<void>((resolve) => {
+              const timer = setTimeout(() => {
+                running.child.kill("SIGKILL");
+                resolve();
+              }, DRAIN_TIMEOUT_MS);
+              running.child.once("close", () => {
+                clearTimeout(timer);
+                resolve();
+              });
+            }),
+          );
+        }
+        await Promise.allSettled(drainPromises);
+        logger.info("Graceful shutdown: all agent processes drained");
       }
+
+      // 2. Stop embedded PostgreSQL if we started it
+      if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
+        logger.info({ signal }, "Stopping embedded PostgreSQL");
+        try {
+          await embeddedPostgres?.stop();
+        } catch (err) {
+          logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
+        }
+      }
+
+      process.exit(0);
     };
-  
+
     process.once("SIGINT", () => {
       void shutdown("SIGINT");
     });

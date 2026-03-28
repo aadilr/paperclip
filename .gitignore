@@ -41,3 +41,7 @@ tmp/
 # Playwright
 tests/e2e/test-results/
 tests/e2e/playwright-report/
+
+# Local launcher / worktrees
+start-paperclip.sh
+.claude/worktrees/
